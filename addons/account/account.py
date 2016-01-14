@@ -300,85 +300,63 @@ class account_account(osv.osv):
                         (__compute will handle their escaping) as a
                         tuple
         """
-        mapping = {
-            'balance': "COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit), 0) as balance",
-            'debit': "COALESCE(SUM(l.debit), 0) as debit",
-            'credit': "COALESCE(SUM(l.credit), 0) as credit",
-            # by convention, foreign_balance is 0 when the account has no secondary currency, because the amounts may be in different currencies
-            'foreign_balance': "(SELECT CASE WHEN currency_id IS NULL THEN 0 ELSE COALESCE(SUM(l.amount_currency), 0) END FROM account_account WHERE id IN (l.account_id)) as foreign_balance",
-        }
-        #get all the necessary accounts
-        children_and_consolidated = self._get_children_and_consol(cr, uid, ids, context=context)
-        #compute for each account the balance/debit/credit from the move lines
         accounts = {}
         res = {}
-        null_result = dict((fn, 0.0) for fn in field_names)
-        if children_and_consolidated:
-            aml_query = self.pool.get('account.move.line')._query_get(cr, uid, context=context)
+        aml_query = self.pool.get('account.move.line')._query_get(cr, uid, context=context)
 
-            wheres = [""]
-            if query.strip():
-                wheres.append(query.strip())
-            if aml_query.strip():
-                wheres.append(aml_query.strip())
-            filters = " AND ".join(wheres)
-            # IN might not work ideally in case there are too many
-            # children_and_consolidated, in that case join on a
-            # values() e.g.:
-            # SELECT l.account_id as id FROM account_move_line l
-            # INNER JOIN (VALUES (id1), (id2), (id3), ...) AS tmp (id)
-            # ON l.account_id = tmp.id
-            # or make _get_children_and_consol return a query and join on that
-            request = ("SELECT l.account_id as id, " +\
-                       ', '.join(mapping.values()) +
-                       " FROM account_move_line l" \
-                       " WHERE l.account_id IN %s " \
-                            + filters +
-                       " GROUP BY l.account_id")
+        wheres = [""]
+        if query.strip():
+            wheres.append(query.strip())
+        if aml_query.strip():
+            wheres.append(aml_query.strip())
+        filters = " AND ".join(wheres)
+        children_and_consolidated = ids
+        if children_and_consolidated:
+            request = '''SELECT *, debit-credit AS balance
+            FROM (
+                SELECT account_child_and_consolidated.parent_id AS id,
+                    SUM( COALESCE(l.debit,0) ) AS debit, SUM( COALESCE(l.credit,0) ) AS credit,
+                    COALESCE(SUM(l.amount_currency), 0) as foreign_balance
+                FROM (
+                    SELECT account_child_vw.parent_id, COALESCE( account_consolidated_vw.child_id, account_child_vw.child_id) AS child_id
+                    FROM (
+                        SELECT aa_tree_1.id AS parent_id, aa_tree_2.id AS child_id
+                        FROM account_account aa_tree_1
+                        LEFT OUTER JOIN account_account aa_tree_2
+                           ON aa_tree_2.parent_left 
+                              BETWEEN aa_tree_1.parent_left AND aa_tree_1.parent_right
+                    ) account_child_vw
+                    LEFT OUTER JOIN 
+                    (
+                        SELECT aa_tree_1.id AS parent_id, aa_tree_4.id AS child_id
+                        FROM account_account_consol_rel
+                        INNER JOIN account_account aa_tree_1
+                           ON aa_tree_1.id = account_account_consol_rel.child_id
+                        INNER JOIN account_account aa_tree_2
+                           ON aa_tree_2.id = account_account_consol_rel.parent_id
+                        LEFT OUTER JOIN account_account aa_tree_3
+                           ON aa_tree_3.parent_left 
+                              BETWEEN aa_tree_1.parent_left AND aa_tree_1.parent_right
+                        LEFT OUTER JOIN account_account aa_tree_4
+                           ON aa_tree_4.parent_left 
+                              BETWEEN aa_tree_2.parent_left AND aa_tree_2.parent_right
+                    ) account_consolidated_vw
+                    ON account_child_vw.child_id = account_consolidated_vw.parent_id
+                ) account_child_and_consolidated
+                LEFT OUTER JOIN account_move_line l
+                  ON l.account_id = account_child_and_consolidated.child_id
+                ''' \
+               'WHERE account_child_and_consolidated.parent_id IN %s ' \
+                + filters + \
+                'GROUP BY account_child_and_consolidated.parent_id ) subvw'
             params = (tuple(children_and_consolidated),) + query_params
             cr.execute(request, params)
-
-            for row in cr.dictfetchall():
-                accounts[row['id']] = row
-
-            # consolidate accounts with direct children
-            children_and_consolidated.reverse()
-            brs = list(self.browse(cr, uid, children_and_consolidated, context=context))
-            sums = {}
-            currency_obj = self.pool.get('res.currency')
-            while brs:
-                current = brs.pop(0)
-#                can_compute = True
-#                for child in current.child_id:
-#                    if child.id not in sums:
-#                        can_compute = False
-#                        try:
-#                            brs.insert(0, brs.pop(brs.index(child)))
-#                        except ValueError:
-#                            brs.insert(0, child)
-#                if can_compute:
-                for fn in field_names:
-                    sums.setdefault(current.id, {})[fn] = accounts.get(current.id, {}).get(fn, 0.0)
-                    for child in current.child_id:
-                        if child.company_id.currency_id.id == current.company_id.currency_id.id:
-                            sums[current.id][fn] += sums[child.id][fn]
-                        else:
-                            sums[current.id][fn] += currency_obj.compute(cr, uid, child.company_id.currency_id.id, current.company_id.currency_id.id, sums[child.id][fn], context=context)
-
-                # as we have to relay on values computed before this is calculated separately than previous fields
-                if current.currency_id and current.exchange_rate and \
-                            ('adjusted_balance' in field_names or 'unrealized_gain_loss' in field_names):
-                    # Computing Adjusted Balance and Unrealized Gains and losses
-                    # Adjusted Balance = Foreign Balance / Exchange Rate
-                    # Unrealized Gains and losses = Adjusted Balance - Balance
-                    adj_bal = sums[current.id].get('foreign_balance', 0.0) / current.exchange_rate
-                    sums[current.id].update({'adjusted_balance': adj_bal, 'unrealized_gain_loss': adj_bal - sums[current.id].get('balance', 0.0)})
-
-            for id in ids:
-                res[id] = sums.get(id, null_result)
-        else:
-            for id in ids:
-                res[id] = null_result
+            for res1 in cr.dictfetchall():
+                accounts[res1['id']] = res1
+        res = {}
+        for id_ in ids:
+            for field_name in field_names:
+                res.setdefault(id_, {})[field_name] = accounts.get(id_, {}).get(field_name, 0.0)
         return res
 
     def _get_company_currency(self, cr, uid, ids, field_name, arg, context=None):
